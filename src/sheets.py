@@ -7,13 +7,10 @@ Read and manage Google Sheets via the Sheets REST API v4.
 Ref: https://developers.google.com/sheets/api/guides/concepts
 """
 
-import json
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import urlencode
 
-from mcp.types import TextContent, Tool
-
-from dedalus_mcp.types import ToolAnnotations
+from pydantic import BaseModel
 
 from dedalus_mcp import HttpMethod, HttpRequest, get_context, tool
 from dedalus_mcp.auth import Connection, SecretKeys
@@ -29,27 +26,40 @@ sheets = Connection(
     auth_header_format="Bearer {api_key}",
 )
 
+
+class SheetsResult(BaseModel):
+    success: bool
+    data: Any = None
+    error: str | None = None
+
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
 
-SheetsResult = list[TextContent]
 
-
-async def _req(method: HttpMethod, path: str, body: dict | None = None) -> SheetsResult:
-    """Make a Sheets API request and return JSON as TextContent."""
+async def _request(
+    method: HttpMethod,
+    path: str,
+    params: dict[str, Any] | None = None,
+    body: dict[str, Any] | None = None,
+) -> SheetsResult:
+    """Make a Sheets API request and return result."""
     ctx = get_context()
-    resp = await ctx.dispatch("google-sheets-mcp", HttpRequest(method=method, path=path, body=body))
-    if resp.success:
-        data = resp.response.body or {}
-        return [TextContent(type="text", text=json.dumps(data, indent=2))]
-    error = resp.error.message if resp.error else "Request failed"
-    return [TextContent(type="text", text=json.dumps({"error": error}, indent=2))]
 
+    if params:
+        query_string = urlencode({k: v for k, v in params.items() if v is not None})
+        if query_string:
+            path = f"{path}?{query_string}"
 
-def _encode_range(range_a1: str) -> str:
-    """URL-encode an A1 notation range, preserving safe characters."""
-    return quote(range_a1, safe="!:$'(),-._~")
+    request = HttpRequest(method=method, path=path, body=body)
+    response = await ctx.dispatch("google-sheets-mcp", request)
+
+    if response.success:
+        return SheetsResult(success=True, data=response.response.body)
+
+    msg = response.error.message if response.error else "Request failed"
+    return SheetsResult(success=False, error=msg)
 
 
 # -----------------------------------------------------------------------------
@@ -57,40 +67,35 @@ def _encode_range(range_a1: str) -> str:
 # -----------------------------------------------------------------------------
 
 
-@tool(
-    description="Get spreadsheet metadata including title, locale, sheets, and named ranges.",
-    tags=["spreadsheet", "read"],
-    annotations=ToolAnnotations(readOnlyHint=True),
-)
+@tool(description="Get spreadsheet metadata including title, locale, sheets, and named ranges")
 async def sheets_get_spreadsheet(
     spreadsheet_id: str,
     include_grid_data: bool = False,
-    ranges: str = "",
-    fields: str = "",
+    ranges: str | None = None,
+    fields: str | None = None,
 ) -> SheetsResult:
-    """Get spreadsheet metadata. Optionally include grid data for specific ranges."""
-    params = [f"includeGridData={str(include_grid_data).lower()}"]
+    params: dict[str, Any] = {
+        "includeGridData": str(include_grid_data).lower(),
+    }
     if ranges:
-        for r in ranges.split(","):
-            params.append(f"ranges={r.strip()}")
+        params["ranges"] = ranges
     if fields:
-        params.append(f"fields={fields}")
+        params["fields"] = fields
 
-    query_string = "&".join(params)
-    return await _req(HttpMethod.GET, f"/v4/spreadsheets/{spreadsheet_id}?{query_string}")
-
-
-@tool(
-    description="List all sheets/tabs in a spreadsheet with their properties (ID, title, index, grid size).",
-    tags=["spreadsheet", "read"],
-    annotations=ToolAnnotations(readOnlyHint=True),
-)
-async def sheets_list_sheets(spreadsheet_id: str) -> SheetsResult:
-    """List sheets/tabs with compact metadata."""
-    fields = "spreadsheetId,properties(title),sheets(properties(sheetId,title,index,gridProperties))"
-    return await _req(
+    return await _request(
         HttpMethod.GET,
-        f"/v4/spreadsheets/{spreadsheet_id}?fields={fields}",
+        f"/v4/spreadsheets/{spreadsheet_id}",
+        params=params,
+    )
+
+
+@tool(description="List all sheets/tabs in a spreadsheet with their properties (ID, title, index, grid size)")
+async def sheets_list_sheets(spreadsheet_id: str) -> SheetsResult:
+    fields = "spreadsheetId,properties(title),sheets(properties(sheetId,title,index,gridProperties))"
+    return await _request(
+        HttpMethod.GET,
+        f"/v4/spreadsheets/{spreadsheet_id}",
+        params={"fields": fields},
     )
 
 
@@ -99,11 +104,7 @@ async def sheets_list_sheets(spreadsheet_id: str) -> SheetsResult:
 # -----------------------------------------------------------------------------
 
 
-@tool(
-    description="Read values from a single range in A1 notation (e.g., 'Sheet1!A1:B10').",
-    tags=["values", "read"],
-    annotations=ToolAnnotations(readOnlyHint=True),
-)
+@tool(description="Read values from a single range in A1 notation (e.g., 'Sheet1!A1:B10')")
 async def sheets_get_values(
     spreadsheet_id: str,
     range: str,
@@ -111,25 +112,18 @@ async def sheets_get_values(
     value_render_option: str = "FORMATTED_VALUE",
     date_time_render_option: str = "SERIAL_NUMBER",
 ) -> SheetsResult:
-    """Get values from a range. Returns 2D array of cell values."""
-    encoded_range = _encode_range(range)
-    params = [
-        f"majorDimension={major_dimension}",
-        f"valueRenderOption={value_render_option}",
-        f"dateTimeRenderOption={date_time_render_option}",
-    ]
-    query_string = "&".join(params)
-    return await _req(
+    return await _request(
         HttpMethod.GET,
-        f"/v4/spreadsheets/{spreadsheet_id}/values/{encoded_range}?{query_string}",
+        f"/v4/spreadsheets/{spreadsheet_id}/values/{range}",
+        params={
+            "majorDimension": major_dimension,
+            "valueRenderOption": value_render_option,
+            "dateTimeRenderOption": date_time_render_option,
+        },
     )
 
 
-@tool(
-    description="Read values from multiple ranges at once. More efficient than multiple single-range calls.",
-    tags=["values", "read"],
-    annotations=ToolAnnotations(readOnlyHint=True),
-)
+@tool(description="Read values from multiple ranges at once. More efficient than multiple single-range calls")
 async def sheets_batch_get_values(
     spreadsheet_id: str,
     ranges: str,
@@ -137,19 +131,15 @@ async def sheets_batch_get_values(
     value_render_option: str = "FORMATTED_VALUE",
     date_time_render_option: str = "SERIAL_NUMBER",
 ) -> SheetsResult:
-    """Get values from multiple ranges. Ranges should be comma-separated A1 notation."""
-    params = [
-        f"majorDimension={major_dimension}",
-        f"valueRenderOption={value_render_option}",
-        f"dateTimeRenderOption={date_time_render_option}",
-    ]
-    for r in ranges.split(","):
-        params.append(f"ranges={r.strip()}")
-
-    query_string = "&".join(params)
-    return await _req(
+    return await _request(
         HttpMethod.GET,
-        f"/v4/spreadsheets/{spreadsheet_id}/values:batchGet?{query_string}",
+        f"/v4/spreadsheets/{spreadsheet_id}/values:batchGet",
+        params={
+            "ranges": ranges,
+            "majorDimension": major_dimension,
+            "valueRenderOption": value_render_option,
+            "dateTimeRenderOption": date_time_render_option,
+        },
     )
 
 
@@ -158,11 +148,7 @@ async def sheets_batch_get_values(
 # -----------------------------------------------------------------------------
 
 
-@tool(
-    description="Write values to a single range. Values are parsed as if typed by user (USER_ENTERED).",
-    tags=["values", "write"],
-    annotations=ToolAnnotations(readOnlyHint=False),
-)
+@tool(description="Write values to a single range. Values are parsed as if typed by user (USER_ENTERED)")
 async def sheets_update_values(
     spreadsheet_id: str,
     range: str,
@@ -170,50 +156,36 @@ async def sheets_update_values(
     value_input_option: str = "USER_ENTERED",
     include_values_in_response: bool = False,
 ) -> SheetsResult:
-    """Update values in a range. Values is a 2D array matching the range dimensions."""
-    encoded_range = _encode_range(range)
-    params = [
-        f"valueInputOption={value_input_option}",
-        f"includeValuesInResponse={str(include_values_in_response).lower()}",
-    ]
-    query_string = "&".join(params)
-    body = {"values": values}
-    return await _req(
+    return await _request(
         HttpMethod.PUT,
-        f"/v4/spreadsheets/{spreadsheet_id}/values/{encoded_range}?{query_string}",
-        body,
+        f"/v4/spreadsheets/{spreadsheet_id}/values/{range}",
+        params={
+            "valueInputOption": value_input_option,
+            "includeValuesInResponse": str(include_values_in_response).lower(),
+        },
+        body={"values": values},
     )
 
 
-@tool(
-    description="Write values to multiple ranges at once. More efficient than multiple single-range updates.",
-    tags=["values", "write"],
-    annotations=ToolAnnotations(readOnlyHint=False),
-)
+@tool(description="Write values to multiple ranges at once. More efficient than multiple single-range updates")
 async def sheets_batch_update_values(
     spreadsheet_id: str,
     data: list[dict[str, Any]],
     value_input_option: str = "USER_ENTERED",
     include_values_in_response: bool = False,
 ) -> SheetsResult:
-    """Batch update values. Data is list of {range: str, values: list[list]} objects."""
-    body = {
-        "valueInputOption": value_input_option,
-        "includeValuesInResponse": include_values_in_response,
-        "data": data,
-    }
-    return await _req(
+    return await _request(
         HttpMethod.POST,
         f"/v4/spreadsheets/{spreadsheet_id}/values:batchUpdate",
-        body,
+        body={
+            "valueInputOption": value_input_option,
+            "includeValuesInResponse": include_values_in_response,
+            "data": data,
+        },
     )
 
 
-@tool(
-    description="Append values after the last row of data in a range. Useful for adding new rows.",
-    tags=["values", "write"],
-    annotations=ToolAnnotations(readOnlyHint=False),
-)
+@tool(description="Append values after the last row of data in a range. Useful for adding new rows")
 async def sheets_append_values(
     spreadsheet_id: str,
     range: str,
@@ -222,37 +194,26 @@ async def sheets_append_values(
     insert_data_option: str = "INSERT_ROWS",
     include_values_in_response: bool = False,
 ) -> SheetsResult:
-    """Append values after existing data. INSERT_ROWS adds new rows, OVERWRITE overwrites."""
-    encoded_range = _encode_range(range)
-    params = [
-        f"valueInputOption={value_input_option}",
-        f"insertDataOption={insert_data_option}",
-        f"includeValuesInResponse={str(include_values_in_response).lower()}",
-    ]
-    query_string = "&".join(params)
-    body = {"values": values}
-    return await _req(
+    return await _request(
         HttpMethod.POST,
-        f"/v4/spreadsheets/{spreadsheet_id}/values/{encoded_range}:append?{query_string}",
-        body,
+        f"/v4/spreadsheets/{spreadsheet_id}/values/{range}:append",
+        params={
+            "valueInputOption": value_input_option,
+            "insertDataOption": insert_data_option,
+            "includeValuesInResponse": str(include_values_in_response).lower(),
+        },
+        body={"values": values},
     )
 
 
-@tool(
-    description="Clear values from a range while keeping formatting.",
-    tags=["values", "write"],
-    annotations=ToolAnnotations(readOnlyHint=False),
-)
+@tool(description="Clear values from a range while keeping formatting")
 async def sheets_clear_values(
     spreadsheet_id: str,
     range: str,
 ) -> SheetsResult:
-    """Clear values from a range. Formatting is preserved."""
-    encoded_range = _encode_range(range)
-    return await _req(
+    return await _request(
         HttpMethod.POST,
-        f"/v4/spreadsheets/{spreadsheet_id}/values/{encoded_range}:clear",
-        {},
+        f"/v4/spreadsheets/{spreadsheet_id}/values/{range}:clear",
     )
 
 
@@ -261,48 +222,37 @@ async def sheets_clear_values(
 # -----------------------------------------------------------------------------
 
 
-@tool(
-    description="Execute batch updates on a spreadsheet (add sheets, format cells, create charts, etc.).",
-    tags=["spreadsheet", "write"],
-    annotations=ToolAnnotations(readOnlyHint=False),
-)
+@tool(description="Execute batch updates on a spreadsheet (add sheets, format cells, create charts, etc.)")
 async def sheets_batch_update(
     spreadsheet_id: str,
     requests: list[dict[str, Any]],
     include_spreadsheet_in_response: bool = False,
 ) -> SheetsResult:
-    """Execute batch spreadsheet updates. Requests is list of update request objects."""
-    body = {
-        "requests": requests,
-        "includeSpreadsheetInResponse": include_spreadsheet_in_response,
-    }
-    return await _req(
+    return await _request(
         HttpMethod.POST,
         f"/v4/spreadsheets/{spreadsheet_id}:batchUpdate",
-        body,
+        body={
+            "requests": requests,
+            "includeSpreadsheetInResponse": include_spreadsheet_in_response,
+        },
     )
 
 
-@tool(
-    description="Create a new spreadsheet with optional title and sheets.",
-    tags=["spreadsheet", "write"],
-    annotations=ToolAnnotations(readOnlyHint=False),
-)
+@tool(description="Create a new spreadsheet with optional title and sheets")
 async def sheets_create(
-    title: str,
-    sheet_titles: str = "",
+    spreadsheet_title: str,
+    sheet_titles: str | None = None,
 ) -> SheetsResult:
-    """Create a new spreadsheet. Optionally provide comma-separated sheet titles."""
     body: dict[str, Any] = {
-        "properties": {"title": title},
+        "properties": {"title": spreadsheet_title},
     }
     if sheet_titles:
         body["sheets"] = [{"properties": {"title": t.strip()}} for t in sheet_titles.split(",")]
 
-    return await _req(
+    return await _request(
         HttpMethod.POST,
         "/v4/spreadsheets",
-        body,
+        body=body,
     )
 
 
@@ -310,16 +260,13 @@ async def sheets_create(
 # Export
 # -----------------------------------------------------------------------------
 
-sheets_tools: list[Tool] = [
-    # Spreadsheet
+sheets_tools = [
     sheets_get_spreadsheet,
     sheets_list_sheets,
     sheets_create,
     sheets_batch_update,
-    # Values (Read)
     sheets_get_values,
     sheets_batch_get_values,
-    # Values (Write)
     sheets_update_values,
     sheets_batch_update_values,
     sheets_append_values,

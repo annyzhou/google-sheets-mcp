@@ -13,7 +13,6 @@ from dedalus_mcp import MCPServer
 from dedalus_mcp.server import TransportSecuritySettings
 
 from sheets import sheets, sheets_tools
-from smoke import smoke_tools
 
 
 def create_server() -> MCPServer:
@@ -31,5 +30,5 @@ def create_server() -> MCPServer:
 async def main() -> None:
     """Start MCP server."""
     server = create_server()
-    server.collect(*smoke_tools, *sheets_tools)
+    server.collect(*sheets_tools)
     await server.serve(port=8080)
